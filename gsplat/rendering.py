@@ -557,7 +557,15 @@ def rasterization(
         # Exact hard visibility is piecewise constant in terminator depth. Keep
         # the tensor in autograd so callers receive its mathematically correct
         # zero gradient away from an ordering discontinuity rather than None.
-        depth_dependency = terminator_depth[..., None] * 0.0
+        # Infinite depth disables termination for pixels without an opaque
+        # surface. Multiplying that sentinel directly by zero produces NaN and
+        # erases the otherwise valid Gaussian result during hybrid assembly.
+        finite_terminator_depth = torch.where(
+            torch.isfinite(terminator_depth),
+            terminator_depth,
+            torch.zeros_like(terminator_depth),
+        )
+        depth_dependency = finite_terminator_depth[..., None] * 0.0
         mixed_colors = mixed_colors + depth_dependency
         mixed_alphas = mixed_alphas + depth_dependency
         meta["terminator_transmittance"] = front_transmittance + depth_dependency
