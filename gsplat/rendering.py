@@ -558,6 +558,12 @@ def rasterization(
             packed=packed,
             absgrad=absgrad,
         )
+        # Exact hard visibility is piecewise constant in terminator depth. Keep
+        # the tensor in autograd so callers receive its mathematically correct
+        # zero gradient away from an ordering discontinuity rather than None.
+        depth_dependency = terminator_depth[..., None] * 0.0
+        front_colors = front_colors + depth_dependency
+        front_alphas = front_alphas + depth_dependency
         coverage = terminator_coverage[..., None]
         meta["terminator_transmittance"] = 1.0 - front_alphas
         return (
