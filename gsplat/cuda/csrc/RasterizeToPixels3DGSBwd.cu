@@ -12,7 +12,7 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
-template <uint32_t CDIM, typename scalar_t>
+template <uint32_t CDIM, typename scalar_t, bool USE_TERMINATOR>
 __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t I,
     const uint32_t N,
@@ -23,6 +23,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const vec3 *__restrict__ conics,          // [..., N, 3] or [nnz, 3]
     const scalar_t *__restrict__ colors,      // [..., N, CDIM] or [nnz, CDIM]
     const scalar_t *__restrict__ opacities,   // [..., N] or [nnz]
+    const scalar_t *__restrict__ depths,
+    const scalar_t *__restrict__ terminator_depths,
+    const scalar_t *__restrict__ terminator_coverages,
     const scalar_t *__restrict__ backgrounds, // [..., CDIM] or [nnz, CDIM]
     const bool *__restrict__ masks,           // [..., tile_height, tile_width]
     const uint32_t image_width,
@@ -35,18 +38,21 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     // fwd outputs
     const scalar_t
         *__restrict__ render_alphas,      // [..., image_height, image_width, 1]
+    const scalar_t *__restrict__ front_transmittances,
     const int32_t *__restrict__ last_ids, // [..., image_height, image_width]
     // grad outputs
     const scalar_t *__restrict__ v_render_colors, // [..., image_height,
                                                   // image_width, CDIM]
     const scalar_t
         *__restrict__ v_render_alphas, // [..., image_height, image_width, 1]
+    const scalar_t *__restrict__ v_front_transmittances,
     // grad inputs
     vec2 *__restrict__ v_means2d_abs,  // [..., N, 2] or [nnz, 2]
     vec2 *__restrict__ v_means2d,      // [..., N, 2] or [nnz, 2]
     vec3 *__restrict__ v_conics,       // [..., N, 3] or [nnz, 3]
     scalar_t *__restrict__ v_colors,   // [..., N, CDIM] or [nnz, CDIM]
-    scalar_t *__restrict__ v_opacities // [..., N] or [nnz]
+    scalar_t *__restrict__ v_opacities, // [..., N] or [nnz]
+    scalar_t *__restrict__ v_terminator_coverages
 ) {
     auto block = cg::this_thread_block();
     uint32_t image_id = block.group_index().x;
@@ -60,6 +66,13 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     last_ids += image_id * image_height * image_width;
     v_render_colors += image_id * image_height * image_width * CDIM;
     v_render_alphas += image_id * image_height * image_width;
+    if constexpr (USE_TERMINATOR) {
+        terminator_depths += image_id * image_height * image_width;
+        terminator_coverages += image_id * image_height * image_width;
+        front_transmittances += image_id * image_height * image_width;
+        v_front_transmittances += image_id * image_height * image_width;
+        v_terminator_coverages += image_id * image_height * image_width;
+    }
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
     }
@@ -67,20 +80,31 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
         masks += image_id * tile_height * tile_width;
     }
 
-    // when the mask is provided, do nothing and return if
-    // this tile is labeled as False
+    const bool inside = (i < image_height && j < image_width);
+    const int32_t pix_id =
+        inside ? i * image_width + j : image_width * image_height - 1;
+
+    // A disabled tile has no Gaussian derivatives, but its coverage still
+    // controls the uncovered background in terminator mode.
     if (masks != nullptr && !masks[tile_id]) {
+        if constexpr (USE_TERMINATOR) {
+            if (inside) {
+                float v_coverage = 0.0f;
+                if (backgrounds != nullptr) {
+#pragma unroll
+                    for (uint32_t k = 0; k < CDIM; ++k) {
+                        v_coverage -= backgrounds[k] *
+                                      v_render_colors[pix_id * CDIM + k];
+                    }
+                }
+                v_terminator_coverages[pix_id] = v_coverage;
+            }
+        }
         return;
     }
 
     const float px = (float)j + 0.5f;
     const float py = (float)i + 0.5f;
-    // clamp this value to the last pixel
-    const int32_t pix_id =
-        min(i * image_width + j, image_width * image_height - 1);
-
-    // keep not rasterizing threads around for reading data
-    bool inside = (i < image_height && j < image_width);
 
     // have all threads in tile process the same gaussians in batches
     // first collect gaussians between range.x and range.y in batches
@@ -100,14 +124,17 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
         reinterpret_cast<vec3 *>(&id_batch[block_size]); // [block_size]
     vec3 *conic_batch =
         reinterpret_cast<vec3 *>(&xy_opacity_batch[block_size]); // [block_size]
+    float *depth_batch = reinterpret_cast<float *>(&conic_batch[block_size]);
     float *rgbs_batch =
-        (float *)&conic_batch[block_size]; // [block_size * CDIM]
+        USE_TERMINATOR ? &depth_batch[block_size]
+                       : reinterpret_cast<float *>(&conic_batch[block_size]);
 
     // this is the T AFTER the last gaussian in this pixel
     float T_final = 1.0f - render_alphas[pix_id];
     float T = T_final;
     // the contribution from gaussians behind the current one
     float buffer[CDIM] = {0.f};
+    float alpha_buffer = 0.f;
     // index of last gaussian to contribute to this pixel
     const int32_t bin_final = inside ? last_ids[pix_id] : 0;
 
@@ -118,6 +145,13 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
         v_render_c[k] = v_render_colors[pix_id * CDIM + k];
     }
     const float v_render_a = v_render_alphas[pix_id];
+    const float uncovered =
+        USE_TERMINATOR && inside ? 1.0f - terminator_coverages[pix_id] : 1.0f;
+    const float front_T =
+        USE_TERMINATOR && inside ? front_transmittances[pix_id] : T_final;
+    const float v_front_T =
+        USE_TERMINATOR && inside ? v_front_transmittances[pix_id] : 0.0f;
+    float v_coverage = 0.0f;
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -144,6 +178,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             const float opac = opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
             conic_batch[tr] = conics[g];
+            if constexpr (USE_TERMINATOR) {
+                depth_batch[tr] = depths[g];
+            }
 #pragma unroll
             for (uint32_t k = 0; k < CDIM; ++k) {
                 rgbs_batch[tr * CDIM + k] = colors[g * CDIM + k];
@@ -191,6 +228,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             float v_opacity_local = 0.f;
             // initialize everything to 0, only set if the lane is valid
             if (valid) {
+                const bool behind = USE_TERMINATOR &&
+                                    depth_batch[t] > terminator_depths[pix_id];
+                const float weight = behind ? uncovered : 1.0f;
                 // compute the current T for this gaussian
                 float ra = 1.0f / (1.0f - alpha);
                 T *= ra;
@@ -198,17 +238,25 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                 const float fac = alpha * T;
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    v_rgb_local[k] = fac * v_render_c[k];
+                    v_rgb_local[k] = weight * fac * v_render_c[k];
                 }
                 // contribution from this pixel
                 float v_alpha = 0.f;
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    v_alpha += (rgbs_batch[t * CDIM + k] * T - buffer[k] * ra) *
-                               v_render_c[k];
+                    v_alpha +=
+                        (weight * rgbs_batch[t * CDIM + k] * T - buffer[k] * ra) *
+                        v_render_c[k];
                 }
 
-                v_alpha += T_final * ra * v_render_a;
+                if constexpr (USE_TERMINATOR) {
+                    v_alpha += (weight * T - alpha_buffer * ra) * v_render_a;
+                    if (!behind) {
+                        v_alpha += -front_T * ra * v_front_T;
+                    }
+                } else {
+                    v_alpha += T_final * ra * v_render_a;
+                }
                 // contribution from background pixel
                 if (backgrounds != nullptr) {
                     float accum = 0.f;
@@ -216,7 +264,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     for (uint32_t k = 0; k < CDIM; ++k) {
                         accum += backgrounds[k] * v_render_c[k];
                     }
-                    v_alpha += -T_final * ra * accum;
+                    v_alpha += -uncovered * T_final * ra * accum;
                 }
 
                 if (opac * vis <= 0.999f) {
@@ -238,7 +286,19 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
 
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    buffer[k] += rgbs_batch[t * CDIM + k] * fac;
+                    buffer[k] += weight * rgbs_batch[t * CDIM + k] * fac;
+                }
+                alpha_buffer += weight * fac;
+                if constexpr (USE_TERMINATOR) {
+                    if (behind) {
+                        float coverage_term = v_render_a;
+#pragma unroll
+                        for (uint32_t k = 0; k < CDIM; ++k) {
+                            coverage_term +=
+                                rgbs_batch[t * CDIM + k] * v_render_c[k];
+                        }
+                        v_coverage -= fac * coverage_term;
+                    }
                 }
             }
             warpSum<CDIM>(v_rgb_local, warp);
@@ -275,15 +335,31 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             }
         }
     }
+    if constexpr (USE_TERMINATOR) {
+        if (inside && backgrounds != nullptr) {
+            float background_term = 0.f;
+#pragma unroll
+            for (uint32_t k = 0; k < CDIM; ++k) {
+                background_term += backgrounds[k] * v_render_c[k];
+            }
+            v_coverage -= T_final * background_term;
+        }
+        if (inside) {
+            v_terminator_coverages[pix_id] = v_coverage;
+        }
+    }
 }
 
-template <uint32_t CDIM>
-void launch_rasterize_to_pixels_3dgs_bwd_kernel(
+template <uint32_t CDIM, bool USE_TERMINATOR>
+void launch_rasterize_to_pixels_3dgs_bwd_kernel_impl(
     // Gaussian parameters
     const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
+    const at::optional<at::Tensor> depths,
+    const at::optional<at::Tensor> terminator_depths,
+    const at::optional<at::Tensor> terminator_coverages,
     const at::optional<at::Tensor> backgrounds, // [..., 3]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -295,16 +371,19 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     const at::Tensor flatten_ids,  // [n_isects]
     // forward outputs
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::optional<at::Tensor> front_transmittances,
     const at::Tensor last_ids,      // [..., image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
+    const at::optional<at::Tensor> v_front_transmittances,
     // outputs
     at::optional<at::Tensor> v_means2d_abs, // [..., N, 2] or [nnz, 2]
     at::Tensor v_means2d,                   // [..., N, 2] or [nnz, 2]
     at::Tensor v_conics,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
-    at::Tensor v_opacities                  // [..., N] or [nnz]
+    at::Tensor v_opacities,                 // [..., N] or [nnz]
+    at::optional<at::Tensor> v_terminator_coverages
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -321,18 +400,41 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 
     int64_t shmem_size =
         tile_size * tile_size *
-        (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM);
+        (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM +
+         (USE_TERMINATOR ? sizeof(float) : 0));
 
-    if (n_isects == 0) {
-        // skip the kernel launch if there are no elements
+    // With no intersections, only a coverage-weighted background can produce
+    // a CUDA-side gradient. Preserve the cheap no-launch path otherwise.
+    if (n_isects == 0 && !(USE_TERMINATOR && backgrounds.has_value())) {
         return;
+    }
+
+    // Resolve terminator-only optionals only in the terminator specialization.
+    // Keeping optional::value() out of the ordinary launch path is important:
+    // the non-terminator API intentionally supplies nullopt for these tensors.
+    const float *depths_ptr = nullptr;
+    const float *terminator_depths_ptr = nullptr;
+    const float *terminator_coverages_ptr = nullptr;
+    const float *front_transmittances_ptr = nullptr;
+    const float *v_front_transmittances_ptr = nullptr;
+    float *v_terminator_coverages_ptr = nullptr;
+    if constexpr (USE_TERMINATOR) {
+        depths_ptr = depths.value().data_ptr<float>();
+        terminator_depths_ptr = terminator_depths.value().data_ptr<float>();
+        terminator_coverages_ptr = terminator_coverages.value().data_ptr<float>();
+        front_transmittances_ptr =
+            front_transmittances.value().data_ptr<float>();
+        v_front_transmittances_ptr =
+            v_front_transmittances.value().data_ptr<float>();
+        v_terminator_coverages_ptr =
+            v_terminator_coverages.value().data_ptr<float>();
     }
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
     // writes. This requires moving the channel padding from python to C side.
     if (cudaFuncSetAttribute(
-            rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>,
+            rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float, USE_TERMINATOR>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size
         ) != cudaSuccess) {
@@ -343,7 +445,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         );
     }
 
-    rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>
+    rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float, USE_TERMINATOR>
         <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
             I,
             N,
@@ -353,6 +455,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             reinterpret_cast<vec3 *>(conics.data_ptr<float>()),
             colors.data_ptr<float>(),
             opacities.data_ptr<float>(),
+            depths_ptr,
+            terminator_depths_ptr,
+            terminator_coverages_ptr,
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
                                     : nullptr,
             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
@@ -364,9 +469,11 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
             render_alphas.data_ptr<float>(),
+            front_transmittances_ptr,
             last_ids.data_ptr<int32_t>(),
             v_render_colors.data_ptr<float>(),
             v_render_alphas.data_ptr<float>(),
+            v_front_transmittances_ptr,
             v_means2d_abs.has_value()
                 ? reinterpret_cast<vec2 *>(
                       v_means2d_abs.value().data_ptr<float>()
@@ -375,19 +482,24 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
             reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
             v_colors.data_ptr<float>(),
-            v_opacities.data_ptr<float>()
+            v_opacities.data_ptr<float>(),
+            v_terminator_coverages_ptr
         );
 }
 
 // Explicit Instantiation: this should match how it is being called in .cpp
 // file.
 // TODO: this is slow to compile, can we do something about it?
-#define __INS__(CDIM)                                                          \
-    template void launch_rasterize_to_pixels_3dgs_bwd_kernel<CDIM>(            \
+#define __INS__(CDIM, USE_TERMINATOR)                                          \
+    template void                                                              \
+    launch_rasterize_to_pixels_3dgs_bwd_kernel_impl<CDIM, USE_TERMINATOR>(     \
         const at::Tensor means2d,                                              \
         const at::Tensor conics,                                               \
         const at::Tensor colors,                                               \
         const at::Tensor opacities,                                            \
+        const at::optional<at::Tensor> depths,                                 \
+        const at::optional<at::Tensor> terminator_depths,                      \
+        const at::optional<at::Tensor> terminator_coverages,                   \
         const at::optional<at::Tensor> backgrounds,                            \
         const at::optional<at::Tensor> masks,                                  \
         uint32_t image_width,                                                  \
@@ -396,35 +508,42 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         const at::Tensor tile_offsets,                                         \
         const at::Tensor flatten_ids,                                          \
         const at::Tensor render_alphas,                                        \
+        const at::optional<at::Tensor> front_transmittances,                   \
         const at::Tensor last_ids,                                             \
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
+        const at::optional<at::Tensor> v_front_transmittances,                 \
         at::optional<at::Tensor> v_means2d_abs,                                \
         at::Tensor v_means2d,                                                  \
         at::Tensor v_conics,                                                   \
         at::Tensor v_colors,                                                   \
-        at::Tensor v_opacities                                                 \
+        at::Tensor v_opacities,                                                \
+        at::optional<at::Tensor> v_terminator_coverages                        \
     );
 
-__INS__(1)
-__INS__(2)
-__INS__(3)
-__INS__(4)
-__INS__(5)
-__INS__(8)
-__INS__(9)
-__INS__(16)
-__INS__(17)
-__INS__(32)
-__INS__(33)
-__INS__(64)
-__INS__(65)
-__INS__(128)
-__INS__(129)
-__INS__(256)
-__INS__(257)
-__INS__(512)
-__INS__(513)
+#define __INS_BOTH__(CDIM)                                                     \
+    __INS__(CDIM, false)                                                       \
+    __INS__(CDIM, true)
+__INS_BOTH__(1)
+__INS_BOTH__(2)
+__INS_BOTH__(3)
+__INS_BOTH__(4)
+__INS_BOTH__(5)
+__INS_BOTH__(8)
+__INS_BOTH__(9)
+__INS_BOTH__(16)
+__INS_BOTH__(17)
+__INS_BOTH__(32)
+__INS_BOTH__(33)
+__INS_BOTH__(64)
+__INS_BOTH__(65)
+__INS_BOTH__(128)
+__INS_BOTH__(129)
+__INS_BOTH__(256)
+__INS_BOTH__(257)
+__INS_BOTH__(512)
+__INS_BOTH__(513)
+#undef __INS_BOTH__
 #undef __INS__
 
 } // namespace gsplat

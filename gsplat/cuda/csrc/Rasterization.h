@@ -24,6 +24,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor opacities, // [..., N]  or [nnz]
     const at::optional<at::Tensor> depths, // [..., N] or [nnz]
     const at::optional<at::Tensor> terminator_depths, // [..., H, W]
+    const at::optional<at::Tensor> terminator_coverages, // [..., H, W]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -36,16 +37,21 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // outputs
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
+    at::Tensor full_alphas,
+    at::Tensor front_transmittances,
     at::Tensor last_ids // [..., image_height, image_width]
 );
 
-template <uint32_t CDIM>
-void launch_rasterize_to_pixels_3dgs_bwd_kernel(
+template <uint32_t CDIM, bool USE_TERMINATOR>
+void launch_rasterize_to_pixels_3dgs_bwd_kernel_impl(
     // Gaussian parameters
     const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
+    const at::optional<at::Tensor> depths,
+    const at::optional<at::Tensor> terminator_depths,
+    const at::optional<at::Tensor> terminator_coverages,
     const at::optional<at::Tensor> backgrounds, // [..., 3]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -57,16 +63,19 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     const at::Tensor flatten_ids,     // [n_isects]
     // forward outputs
     const at::Tensor render_alphas,   // [..., image_height, image_width, 1]
+    const at::optional<at::Tensor> front_transmittances,
     const at::Tensor last_ids,        // [..., image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
+    const at::optional<at::Tensor> v_front_transmittances,
     // outputs
     at::optional<at::Tensor> v_means2d_abs, // [..., N, 2] or [nnz, 2]
     at::Tensor v_means2d,                   // [..., N, 2] or [nnz, 2]
     at::Tensor v_conics,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
-    at::Tensor v_opacities                  // [..., N] or [nnz]
+    at::Tensor v_opacities,                 // [..., N] or [nnz]
+    at::optional<at::Tensor> v_terminator_coverages
 );
 
 /////////////////////////////////////////////////

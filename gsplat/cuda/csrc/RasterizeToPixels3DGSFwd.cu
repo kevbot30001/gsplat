@@ -26,6 +26,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const scalar_t *__restrict__ opacities,   // [I, N] or [nnz]
     const scalar_t *__restrict__ depths,      // [I, N] or [nnz]
     const scalar_t *__restrict__ terminator_depths, // [I, H, W]
+    const scalar_t *__restrict__ terminator_coverages, // [I, H, W]
     const scalar_t *__restrict__ backgrounds, // [I, CDIM]
     const bool *__restrict__ masks,           // [I, tile_height, tile_width]
     const uint32_t image_width,
@@ -38,6 +39,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     scalar_t
         *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
+    scalar_t *__restrict__ full_alphas,
+    scalar_t *__restrict__ front_transmittances,
     int32_t *__restrict__ last_ids        // [I, image_height, image_width]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
@@ -53,12 +56,17 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     tile_offsets += image_id * tile_height * tile_width;
     render_colors += image_id * image_height * image_width * CDIM;
     render_alphas += image_id * image_height * image_width;
+    if constexpr (USE_TERMINATOR) {
+        full_alphas += image_id * image_height * image_width;
+        front_transmittances += image_id * image_height * image_width;
+    }
     last_ids += image_id * image_height * image_width;
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
     }
     if constexpr (USE_TERMINATOR) {
         terminator_depths += image_id * image_height * image_width;
+        terminator_coverages += image_id * image_height * image_width;
     }
     if (masks != nullptr) {
         masks += image_id * tile_height * tile_width;
@@ -73,14 +81,26 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     bool inside = (i < image_height && j < image_width);
     bool done = !inside;
 
-    // when the mask is provided, render the background color and return
-    // if this tile is labeled as False
-    if (masks != nullptr && inside && !masks[tile_id]) {
+    // A disabled tile contains no Gaussian contributions. Every thread must
+    // take the return (including out-of-bounds threads) because the normal
+    // rasterization path contains block-wide synchronizations.
+    if (masks != nullptr && !masks[tile_id]) {
+        if (!inside) {
+            return;
+        }
+        const float uncovered =
+            USE_TERMINATOR ? 1.0f - terminator_coverages[pix_id] : 1.0f;
 #pragma unroll
         for (uint32_t k = 0; k < CDIM; ++k) {
             render_colors[pix_id * CDIM + k] =
-                backgrounds == nullptr ? 0.0f : backgrounds[k];
+                backgrounds == nullptr ? 0.0f : uncovered * backgrounds[k];
         }
+        render_alphas[pix_id] = 0.0f;
+        if constexpr (USE_TERMINATOR) {
+            full_alphas[pix_id] = 0.0f;
+            front_transmittances[pix_id] = 1.0f;
+        }
+        last_ids[pix_id] = -1;
         return;
     }
 
@@ -110,6 +130,11 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     // numerical precision so we use double for it. However double make bwd 1.5x
     // slower so we stick with float for now.
     float T = 1.0f;
+    float front_T = 1.0f;
+    float mixed_alpha = 0.0f;
+    const float uncovered =
+        USE_TERMINATOR && inside ? 1.0f - terminator_coverages[pix_id] : 1.0f;
+    bool crossed_terminator = false;
     // index of most recent gaussian to write to this thread's pixel
     int32_t cur_idx = -1;
 
@@ -148,10 +173,14 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+            float weight = 1.0f;
             if constexpr (USE_TERMINATOR) {
                 if (depth_batch[t] > terminator_depths[pix_id]) {
-                    done = true;
-                    break;
+                    if (!crossed_terminator) {
+                        front_T = T;
+                        crossed_terminator = true;
+                    }
+                    weight = uncovered;
                 }
             }
             const vec3 conic = conic_batch[t];
@@ -177,8 +206,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             const float *c_ptr = colors + g * CDIM;
 #pragma unroll
             for (uint32_t k = 0; k < CDIM; ++k) {
-                pix_out[k] += c_ptr[k] * vis;
+                pix_out[k] += c_ptr[k] * vis * weight;
             }
+            mixed_alpha += vis * weight;
             cur_idx = static_cast<int32_t>(batch_start + t);
 
             T = next_T;
@@ -186,17 +216,30 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     }
 
     if (inside) {
+        if constexpr (USE_TERMINATOR) {
+            if (!crossed_terminator) {
+                front_T = T;
+            }
+        } else {
+            front_T = T;
+        }
         // Here T is the transmittance AFTER the last gaussian in this pixel.
         // We (should) store double precision as T would be used in backward
         // pass and it can be very small and causing large diff in gradients
         // with float32. However, double precision makes the backward pass 1.5x
         // slower so we stick with float for now.
-        render_alphas[pix_id] = 1.0f - T;
+        if constexpr (USE_TERMINATOR) {
+            full_alphas[pix_id] = 1.0f - T;
+            front_transmittances[pix_id] = front_T;
+            render_alphas[pix_id] = mixed_alpha;
+        } else {
+            render_alphas[pix_id] = 1.0f - T;
+        }
 #pragma unroll
         for (uint32_t k = 0; k < CDIM; ++k) {
             render_colors[pix_id * CDIM + k] =
                 backgrounds == nullptr ? pix_out[k]
-                                       : (pix_out[k] + T * backgrounds[k]);
+                                       : (pix_out[k] + T * backgrounds[k] * uncovered);
         }
         // index in bin of last gaussian in this pixel
         last_ids[pix_id] = cur_idx;
@@ -212,6 +255,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel_impl(
     const at::Tensor opacities, // [..., N]  or [nnz]
     const at::optional<at::Tensor> depths, // [..., N] or [nnz]
     const at::optional<at::Tensor> terminator_depths, // [..., H, W]
+    const at::optional<at::Tensor> terminator_coverages, // [..., H, W]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -224,6 +268,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel_impl(
     // outputs
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
+    at::Tensor full_alphas,
+    at::Tensor front_transmittances,
     at::Tensor last_ids // [..., image_height, image_width]
 ) {
     bool packed = means2d.dim() == 2;
@@ -271,6 +317,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel_impl(
             USE_TERMINATOR ? depths.value().data_ptr<float>() : nullptr,
             USE_TERMINATOR ? terminator_depths.value().data_ptr<float>()
                            : nullptr,
+            USE_TERMINATOR ? terminator_coverages.value().data_ptr<float>()
+                           : nullptr,
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
                                     : nullptr,
             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
@@ -283,6 +331,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel_impl(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
+            USE_TERMINATOR ? full_alphas.data_ptr<float>() : nullptr,
+            USE_TERMINATOR ? front_transmittances.data_ptr<float>() : nullptr,
             last_ids.data_ptr<int32_t>()
         );
 }
@@ -295,6 +345,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor opacities,
     const at::optional<at::Tensor> depths,
     const at::optional<at::Tensor> terminator_depths,
+    const at::optional<at::Tensor> terminator_coverages,
     const at::optional<at::Tensor> backgrounds,
     const at::optional<at::Tensor> masks,
     const uint32_t image_width,
@@ -304,6 +355,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor flatten_ids,
     at::Tensor renders,
     at::Tensor alphas,
+    at::Tensor full_alphas,
+    at::Tensor front_transmittances,
     at::Tensor last_ids
 ) {
     if (terminator_depths.has_value()) {
@@ -314,6 +367,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             opacities,
             depths,
             terminator_depths,
+            terminator_coverages,
             backgrounds,
             masks,
             image_width,
@@ -323,6 +377,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             flatten_ids,
             renders,
             alphas,
+            full_alphas,
+            front_transmittances,
             last_ids
         );
     } else {
@@ -333,6 +389,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             opacities,
             depths,
             terminator_depths,
+            terminator_coverages,
             backgrounds,
             masks,
             image_width,
@@ -342,6 +399,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             flatten_ids,
             renders,
             alphas,
+            full_alphas,
+            front_transmittances,
             last_ids
         );
     }
@@ -358,6 +417,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor opacities,                                            \
         const at::optional<at::Tensor> depths,                                 \
         const at::optional<at::Tensor> terminator_depths,                      \
+        const at::optional<at::Tensor> terminator_coverages,                   \
         const at::optional<at::Tensor> backgrounds,                            \
         const at::optional<at::Tensor> masks,                                  \
         uint32_t image_width,                                                  \
@@ -367,6 +427,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
+        at::Tensor full_alphas,                                                \
+        at::Tensor front_transmittances,                                       \
         at::Tensor last_ids                                                    \
     );
 

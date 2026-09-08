@@ -312,12 +312,19 @@ def rasterization(
                 f"terminator_coverage must have shape {expected_terminator_shape}, "
                 f"got {tuple(terminator_coverage.shape)}"
             )
-        elif terminator_coverage.device != device or terminator_coverage.dtype != means.dtype:
+        elif (
+            terminator_coverage.device != device
+            or terminator_coverage.dtype != means.dtype
+        ):
             raise ValueError("terminator_coverage must match means device and dtype")
         if with_eval3d:
-            raise ValueError("opaque depth termination is not supported with with_eval3d=True")
+            raise ValueError(
+                "opaque depth termination is not supported with with_eval3d=True"
+            )
         if distributed:
-            raise ValueError("opaque depth termination is not supported with distributed=True")
+            raise ValueError(
+                "opaque depth termination is not supported with distributed=True"
+            )
         terminator_depth = terminator_depth.contiguous()
         terminator_coverage = terminator_coverage.clamp(0.0, 1.0).contiguous()
 
@@ -527,7 +534,7 @@ def rasterization(
                 rolling_shutter=rolling_shutter,
                 viewmats_rs=viewmats_rs,
             )
-        full_colors, full_alphas = rasterize_to_pixels(
+        rasterized = rasterize_to_pixels(
             means2d,
             conics,
             colors_chunk,
@@ -540,36 +547,21 @@ def rasterization(
             backgrounds=backgrounds_chunk,
             packed=packed,
             absgrad=absgrad,
+            depths=depths if terminator_depth is not None else None,
+            terminator_depths=terminator_depth,
+            terminator_coverages=terminator_coverage,
         )
         if terminator_depth is None:
-            return full_colors, full_alphas
-        front_colors, front_alphas = rasterize_to_pixels(
-            means2d,
-            conics,
-            colors_chunk,
-            opacities,
-            width,
-            height,
-            tile_size,
-            isect_offsets,
-            flatten_ids,
-            depths=depths,
-            terminator_depths=terminator_depth,
-            packed=packed,
-            absgrad=absgrad,
-        )
+            return rasterized
+        mixed_colors, mixed_alphas, front_transmittance = rasterized
         # Exact hard visibility is piecewise constant in terminator depth. Keep
         # the tensor in autograd so callers receive its mathematically correct
         # zero gradient away from an ordering discontinuity rather than None.
         depth_dependency = terminator_depth[..., None] * 0.0
-        front_colors = front_colors + depth_dependency
-        front_alphas = front_alphas + depth_dependency
-        coverage = terminator_coverage[..., None]
-        meta["terminator_transmittance"] = 1.0 - front_alphas
-        return (
-            torch.lerp(full_colors, front_colors, coverage),
-            torch.lerp(full_alphas, front_alphas, coverage),
-        )
+        mixed_colors = mixed_colors + depth_dependency
+        mixed_alphas = mixed_alphas + depth_dependency
+        meta["terminator_transmittance"] = front_transmittance + depth_dependency
+        return mixed_colors, mixed_alphas
 
     # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:

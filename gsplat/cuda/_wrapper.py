@@ -556,7 +556,8 @@ def rasterize_to_pixels(
     absgrad: bool = False,
     depths: Optional[Tensor] = None,  # [..., N] or [nnz]
     terminator_depths: Optional[Tensor] = None,  # [..., H, W]
-) -> Tuple[Tensor, Tensor]:
+    terminator_coverages: Optional[Tensor] = None,  # [..., H, W]
+) -> Tuple[Tensor, ...]:
     """Rasterizes Gaussians to pixels.
 
     Args:
@@ -584,7 +585,9 @@ def rasterize_to_pixels(
         - **Rendered alphas**. [..., image_height, image_width, 1]
     """
 
-    image_dims = means2d.shape[:-2]
+    # Packed projections have shape [nnz, 2] and therefore carry no image
+    # dimensions. Tile offsets retain those dimensions in both layouts.
+    image_dims = isect_offsets.shape[:-2]
     channels = colors.shape[-1]
     device = means2d.device
     if packed:
@@ -602,8 +605,13 @@ def rasterize_to_pixels(
     if backgrounds is not None:
         assert backgrounds.shape == image_dims + (channels,), backgrounds.shape
         backgrounds = backgrounds.contiguous()
-    if (depths is None) != (terminator_depths is None):
-        raise ValueError("depths and terminator_depths must be provided together")
+    if not (
+        depths is None and terminator_depths is None and terminator_coverages is None
+    ):
+        if depths is None or terminator_depths is None or terminator_coverages is None:
+            raise ValueError(
+                "depths, terminator_depths, and terminator_coverages must be provided together"
+            )
     if depths is not None:
         if packed:
             assert depths.shape == (nnz,), depths.shape
@@ -615,6 +623,8 @@ def rasterize_to_pixels(
         ), terminator_depths.shape
         depths = depths.contiguous()
         terminator_depths = terminator_depths.contiguous()
+        assert terminator_coverages.shape == terminator_depths.shape
+        terminator_coverages = terminator_coverages.contiguous()
     if masks is not None:
         assert masks.shape == isect_offsets.shape, masks.shape
         masks = masks.contiguous()
@@ -673,13 +683,14 @@ def rasterize_to_pixels(
         tile_width * tile_size >= image_width
     ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
 
-    render_colors, render_alphas = _RasterizeToPixels.apply(
+    render_colors, render_alphas, front_transmittances = _RasterizeToPixels.apply(
         means2d.contiguous(),
         conics.contiguous(),
         colors.contiguous(),
         opacities.contiguous(),
         depths,
         terminator_depths,
+        terminator_coverages,
         backgrounds,
         masks,
         image_width,
@@ -692,7 +703,9 @@ def rasterize_to_pixels(
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
-    return render_colors, render_alphas
+    if terminator_depths is None:
+        return render_colors, render_alphas
+    return render_colors, render_alphas, front_transmittances
 
 
 def rasterize_to_pixels_eval3d(
@@ -1280,6 +1293,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         opacities: Tensor,  # [..., N] or [nnz]
         depths: Tensor,  # [..., N] or [nnz], Optional
         terminator_depths: Tensor,  # [..., H, W], Optional
+        terminator_coverages: Tensor,  # [..., H, W], Optional
         backgrounds: Tensor,  # [..., channels], Optional
         masks: Tensor,  # [..., tile_height, tile_width], Optional
         width: int,
@@ -1288,16 +1302,21 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [..., tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
-    ) -> Tuple[Tensor, Tensor]:
-        render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
-            "rasterize_to_pixels_3dgs_fwd"
-        )(
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        (
+            render_colors,
+            render_alphas,
+            full_alphas,
+            front_transmittances,
+            last_ids,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_fwd")(
             means2d,
             conics,
             colors,
             opacities,
             depths,
             terminator_depths,
+            terminator_coverages,
             backgrounds,
             masks,
             width,
@@ -1307,16 +1326,21 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
         )
 
+        saved_full_alphas = render_alphas if terminator_depths is None else full_alphas
         ctx.save_for_backward(
             means2d,
             conics,
             colors,
             opacities,
+            depths,
+            terminator_depths,
+            terminator_coverages,
             backgrounds,
             masks,
             isect_offsets,
             flatten_ids,
-            render_alphas,
+            saved_full_alphas,
+            front_transmittances,
             last_ids,
         )
         ctx.width = width
@@ -1326,30 +1350,43 @@ class _RasterizeToPixels(torch.autograd.Function):
 
         # double to float
         render_alphas = render_alphas.float()
-        return render_colors, render_alphas
+        return render_colors, render_alphas, front_transmittances
 
     @staticmethod
     def backward(
         ctx,
         v_render_colors: Tensor,  # [..., H, W, 3]
         v_render_alphas: Tensor,  # [..., H, W, 1]
+        v_front_transmittances: Tensor,  # [..., H, W, 1]
     ):
         (
             means2d,
             conics,
             colors,
             opacities,
+            depths,
+            terminator_depths,
+            terminator_coverages,
             backgrounds,
             masks,
             isect_offsets,
             flatten_ids,
-            render_alphas,
+            full_alphas,
+            front_transmittances,
             last_ids,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
+        use_terminator = terminator_depths is not None
+        # Native backward uses an explicit mode flag and valid tensor handles.
+        # Empty CUDA tensors avoid optional-tensor conversion at the pybind
+        # boundary while the ordinary kernel specialization ignores their data.
+        empty = front_transmittances
+        native_depths = depths if use_terminator else empty
+        native_terminator_depths = terminator_depths if use_terminator else empty
+        native_terminator_coverages = terminator_coverages if use_terminator else empty
 
         (
             v_means2d_abs,
@@ -1357,11 +1394,15 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_conics,
             v_colors,
             v_opacities,
+            v_terminator_coverages,
         ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_bwd")(
             means2d,
             conics,
             colors,
             opacities,
+            native_depths,
+            native_terminator_depths,
+            native_terminator_coverages,
             backgrounds,
             masks,
             width,
@@ -1369,20 +1410,35 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
-            render_alphas,
+            full_alphas,
+            front_transmittances,
             last_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
+            (
+                v_front_transmittances.contiguous()
+                if v_front_transmittances is not None
+                else torch.zeros_like(front_transmittances)
+            ),
+            use_terminator,
             absgrad,
         )
+
+        if terminator_coverages is None:
+            v_terminator_coverages = None
 
         if absgrad:
             means2d.absgrad = v_means2d_abs
 
-        if ctx.needs_input_grad[6]:
-            v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
-                dim=(-3, -2)
+        if ctx.needs_input_grad[7]:
+            uncovered = (
+                1.0 - terminator_coverages[..., None]
+                if terminator_coverages is not None
+                else 1.0
             )
+            v_backgrounds = (
+                v_render_colors * uncovered * (1.0 - full_alphas).float()
+            ).sum(dim=(-3, -2))
         else:
             v_backgrounds = None
 
@@ -1393,6 +1449,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_opacities,
             None,
             None,
+            v_terminator_coverages,
             v_backgrounds,
             None,
             None,

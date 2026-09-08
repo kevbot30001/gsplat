@@ -17,7 +17,8 @@ namespace gsplat {
 // 3DGS
 ////////////////////////////////////////////////////
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
@@ -25,6 +26,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const at::Tensor opacities, // [..., N]  or [nnz]
     const at::optional<at::Tensor> depths, // [..., N] or [nnz]
     const at::optional<at::Tensor> terminator_depths, // [..., H, W]
+    const at::optional<at::Tensor> terminator_coverages, // [..., H, W]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -51,6 +53,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     if (terminator_depths.has_value()) {
         CHECK_INPUT(terminator_depths.value());
     }
+    if (terminator_coverages.has_value()) {
+        CHECK_INPUT(terminator_coverages.value());
+    }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
     }
@@ -66,6 +71,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     at::DimVector alphas_dims(image_dims);
     alphas_dims.append({image_height, image_width, 1});
     at::Tensor alphas = at::empty(alphas_dims, opt);
+    at::Tensor full_alphas = terminator_depths.has_value()
+                                 ? at::empty(alphas_dims, opt)
+                                 : at::empty({0}, opt);
+    at::Tensor front_transmittances = terminator_depths.has_value()
+                                          ? at::empty(alphas_dims, opt)
+                                          : at::empty({0}, opt);
 
     at::DimVector last_ids_dims(image_dims);
     last_ids_dims.append({image_height, image_width});
@@ -80,6 +91,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             opacities,                                                         \
             depths,                                                            \
             terminator_depths,                                                 \
+            terminator_coverages,                                              \
             backgrounds,                                                       \
             masks,                                                             \
             image_width,                                                       \
@@ -89,6 +101,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             flatten_ids,                                                       \
             renders,                                                           \
             alphas,                                                            \
+            full_alphas,                                                       \
+            front_transmittances,                                              \
             last_ids                                                           \
         );                                                                     \
         break;
@@ -121,16 +135,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     }
 #undef __LAUNCH_KERNEL__
 
-    return std::make_tuple(renders, alphas, last_ids);
+    return std::make_tuple(
+        renders, alphas, full_alphas, front_transmittances, last_ids
+    );
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 rasterize_to_pixels_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,                    // [..., N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., N] or [nnz]
+    const at::Tensor depths,
+    const at::Tensor terminator_depths,
+    const at::Tensor terminator_coverages,
     const at::optional<at::Tensor> backgrounds, // [..., channels]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -142,11 +161,14 @@ rasterize_to_pixels_3dgs_bwd(
     const at::Tensor flatten_ids,  // [n_isects]
     // forward outputs
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor front_transmittances,
     const at::Tensor last_ids,      // [..., image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., image_height, image_width, channels]
     const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor v_front_transmittances,
     // options
+    bool use_terminator,
     bool absgrad
 ) {
     DEVICE_GUARD(means2d);
@@ -160,6 +182,11 @@ rasterize_to_pixels_3dgs_bwd(
     CHECK_INPUT(last_ids);
     CHECK_INPUT(v_render_colors);
     CHECK_INPUT(v_render_alphas);
+    CHECK_INPUT(depths);
+    CHECK_INPUT(terminator_depths);
+    CHECK_INPUT(terminator_coverages);
+    CHECK_INPUT(front_transmittances);
+    CHECK_INPUT(v_front_transmittances);
     if (backgrounds.has_value()) {
         CHECK_INPUT(backgrounds.value());
     }
@@ -173,35 +200,37 @@ rasterize_to_pixels_3dgs_bwd(
     at::Tensor v_conics = at::zeros_like(conics);
     at::Tensor v_colors = at::zeros_like(colors);
     at::Tensor v_opacities = at::zeros_like(opacities);
-    at::Tensor v_means2d_abs;
-    if (absgrad) {
-        v_means2d_abs = at::zeros_like(means2d);
-    }
+    at::Tensor v_terminator_coverages =
+        use_terminator ? at::zeros_like(terminator_coverages)
+                       : at::empty({0}, means2d.options());
+    at::Tensor v_means2d_abs =
+        absgrad ? at::zeros_like(means2d)
+                : at::empty({0}, means2d.options());
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
-        launch_rasterize_to_pixels_3dgs_bwd_kernel<N>(                         \
-            means2d,                                                           \
-            conics,                                                            \
-            colors,                                                            \
-            opacities,                                                         \
-            backgrounds,                                                       \
-            masks,                                                             \
-            image_width,                                                       \
-            image_height,                                                      \
-            tile_size,                                                         \
-            tile_offsets,                                                      \
-            flatten_ids,                                                       \
-            render_alphas,                                                     \
-            last_ids,                                                          \
-            v_render_colors,                                                   \
-            v_render_alphas,                                                   \
-            absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \
-            v_means2d,                                                         \
-            v_conics,                                                          \
-            v_colors,                                                          \
-            v_opacities                                                        \
-        );                                                                     \
+        if (use_terminator) {                                                  \
+            launch_rasterize_to_pixels_3dgs_bwd_kernel_impl<N, true>(          \
+                means2d, conics, colors, opacities, depths, terminator_depths, \
+                terminator_coverages, backgrounds, masks, image_width,         \
+                image_height, tile_size, tile_offsets, flatten_ids,            \
+                render_alphas, front_transmittances, last_ids,                 \
+                v_render_colors, v_render_alphas, v_front_transmittances,      \
+                absgrad ? c10::optional<at::Tensor>(v_means2d_abs)             \
+                        : c10::nullopt,                                        \
+                v_means2d, v_conics, v_colors, v_opacities,                    \
+                c10::optional<at::Tensor>(v_terminator_coverages));            \
+        } else {                                                               \
+            launch_rasterize_to_pixels_3dgs_bwd_kernel_impl<N, false>(         \
+                means2d, conics, colors, opacities, depths,                    \
+                terminator_depths, terminator_coverages, backgrounds, masks,   \
+                image_width, image_height, tile_size, tile_offsets,            \
+                flatten_ids, render_alphas, front_transmittances, last_ids,    \
+                v_render_colors, v_render_alphas, v_front_transmittances,      \
+                absgrad ? c10::optional<at::Tensor>(v_means2d_abs)             \
+                        : c10::nullopt,                                        \
+                v_means2d, v_conics, v_colors, v_opacities, c10::nullopt);     \
+        }                                                                      \
         break;
 
     // TODO: an optimization can be done by passing the actual number of
@@ -232,9 +261,8 @@ rasterize_to_pixels_3dgs_bwd(
     }
 #undef __LAUNCH_KERNEL__
 
-    return std::make_tuple(
-        v_means2d_abs, v_means2d, v_conics, v_colors, v_opacities
-    );
+    return std::make_tuple(v_means2d_abs, v_means2d, v_conics, v_colors,
+                           v_opacities, v_terminator_coverages);
 }
 
 std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
