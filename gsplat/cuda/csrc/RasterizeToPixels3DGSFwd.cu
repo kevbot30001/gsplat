@@ -14,7 +14,7 @@ namespace cg = cooperative_groups;
 // Forward
 ////////////////////////////////////////////////////////////////
 
-template <uint32_t CDIM, typename scalar_t>
+template <uint32_t CDIM, typename scalar_t, bool USE_TERMINATOR>
 __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t I,
     const uint32_t N,
@@ -57,7 +57,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
     }
-    if (terminator_depths != nullptr) {
+    if constexpr (USE_TERMINATOR) {
         terminator_depths += image_id * image_height * image_width;
     }
     if (masks != nullptr) {
@@ -137,7 +137,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             const float opac = opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
             conic_batch[tr] = conics[g];
-            if (depths != nullptr) {
+            if constexpr (USE_TERMINATOR) {
                 depth_batch[tr] = depths[g];
             }
         }
@@ -148,10 +148,11 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
-            if (terminator_depths != nullptr &&
-                depth_batch[t] > terminator_depths[pix_id]) {
-                done = true;
-                break;
+            if constexpr (USE_TERMINATOR) {
+                if (depth_batch[t] > terminator_depths[pix_id]) {
+                    done = true;
+                    break;
+                }
             }
             const vec3 conic = conic_batch[t];
             const vec3 xy_opac = xy_opacity_batch[t];
@@ -202,8 +203,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     }
 }
 
-template <uint32_t CDIM>
-void launch_rasterize_to_pixels_3dgs_fwd_kernel(
+template <uint32_t CDIM, bool USE_TERMINATOR>
+void launch_rasterize_to_pixels_3dgs_fwd_kernel_impl(
     // Gaussian parameters
     const at::Tensor means2d,   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
@@ -240,13 +241,13 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
 
     int64_t shmem_size = tile_size * tile_size *
                          (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) +
-                          (depths.has_value() ? sizeof(float) : 0));
+                          (USE_TERMINATOR ? sizeof(float) : 0));
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
     // writes. This requires moving the channel padding from python to C side.
     if (cudaFuncSetAttribute(
-            rasterize_to_pixels_3dgs_fwd_kernel<CDIM, float>,
+            rasterize_to_pixels_3dgs_fwd_kernel<CDIM, float, USE_TERMINATOR>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size
         ) != cudaSuccess) {
@@ -257,7 +258,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         );
     }
 
-    rasterize_to_pixels_3dgs_fwd_kernel<CDIM, float>
+    rasterize_to_pixels_3dgs_fwd_kernel<CDIM, float, USE_TERMINATOR>
         <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
             I,
             N,
@@ -267,10 +268,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             reinterpret_cast<vec3 *>(conics.data_ptr<float>()),
             colors.data_ptr<float>(),
             opacities.data_ptr<float>(),
-            depths.has_value() ? depths.value().data_ptr<float>() : nullptr,
-            terminator_depths.has_value()
-                ? terminator_depths.value().data_ptr<float>()
-                : nullptr,
+            USE_TERMINATOR ? depths.value().data_ptr<float>() : nullptr,
+            USE_TERMINATOR ? terminator_depths.value().data_ptr<float>()
+                           : nullptr,
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
                                     : nullptr,
             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
@@ -285,6 +285,66 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>()
         );
+}
+
+template <uint32_t CDIM>
+void launch_rasterize_to_pixels_3dgs_fwd_kernel(
+    const at::Tensor means2d,
+    const at::Tensor conics,
+    const at::Tensor colors,
+    const at::Tensor opacities,
+    const at::optional<at::Tensor> depths,
+    const at::optional<at::Tensor> terminator_depths,
+    const at::optional<at::Tensor> backgrounds,
+    const at::optional<at::Tensor> masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,
+    const at::Tensor flatten_ids,
+    at::Tensor renders,
+    at::Tensor alphas,
+    at::Tensor last_ids
+) {
+    if (terminator_depths.has_value()) {
+        launch_rasterize_to_pixels_3dgs_fwd_kernel_impl<CDIM, true>(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            depths,
+            terminator_depths,
+            backgrounds,
+            masks,
+            image_width,
+            image_height,
+            tile_size,
+            tile_offsets,
+            flatten_ids,
+            renders,
+            alphas,
+            last_ids
+        );
+    } else {
+        launch_rasterize_to_pixels_3dgs_fwd_kernel_impl<CDIM, false>(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            depths,
+            terminator_depths,
+            backgrounds,
+            masks,
+            image_width,
+            image_height,
+            tile_size,
+            tile_offsets,
+            flatten_ids,
+            renders,
+            alphas,
+            last_ids
+        );
+    }
 }
 
 // Explicit Instantiation: this should match how it is being called in .cpp
