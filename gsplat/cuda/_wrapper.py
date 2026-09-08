@@ -554,6 +554,8 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
+    depths: Optional[Tensor] = None,  # [..., N] or [nnz]
+    terminator_depths: Optional[Tensor] = None,  # [..., H, W]
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
@@ -567,6 +569,9 @@ def rasterize_to_pixels(
         tile_size: Tile size.
         isect_offsets: Intersection offsets outputs from `isect_offset_encode()`. [..., tile_height, tile_width]
         flatten_ids: The global flatten indices in [I * N] or [nnz] from  `isect_tiles()`. [n_isects]
+        depths: Per-Gaussian camera-space depths used with ``terminator_depths``.
+        terminator_depths: Optional per-pixel opaque surface depths. Gaussians at
+            equal depth remain visible. [..., image_height, image_width].
         backgrounds: Background colors. [..., channels]. Default: None.
         masks: Optional tile mask to skip rendering GS to masked tiles. [..., tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
@@ -597,6 +602,19 @@ def rasterize_to_pixels(
     if backgrounds is not None:
         assert backgrounds.shape == image_dims + (channels,), backgrounds.shape
         backgrounds = backgrounds.contiguous()
+    if (depths is None) != (terminator_depths is None):
+        raise ValueError("depths and terminator_depths must be provided together")
+    if depths is not None:
+        if packed:
+            assert depths.shape == (nnz,), depths.shape
+        else:
+            assert depths.shape == image_dims + (N,), depths.shape
+        assert terminator_depths.shape == image_dims + (
+            image_height,
+            image_width,
+        ), terminator_depths.shape
+        depths = depths.contiguous()
+        terminator_depths = terminator_depths.contiguous()
     if masks is not None:
         assert masks.shape == isect_offsets.shape, masks.shape
         masks = masks.contiguous()
@@ -660,6 +678,8 @@ def rasterize_to_pixels(
         conics.contiguous(),
         colors.contiguous(),
         opacities.contiguous(),
+        depths,
+        terminator_depths,
         backgrounds,
         masks,
         image_width,
@@ -1258,6 +1278,8 @@ class _RasterizeToPixels(torch.autograd.Function):
         conics: Tensor,  # [..., N, 3] or [nnz, 3]
         colors: Tensor,  # [..., N, channels] or [nnz, channels]
         opacities: Tensor,  # [..., N] or [nnz]
+        depths: Tensor,  # [..., N] or [nnz], Optional
+        terminator_depths: Tensor,  # [..., H, W], Optional
         backgrounds: Tensor,  # [..., channels], Optional
         masks: Tensor,  # [..., tile_height, tile_width], Optional
         width: int,
@@ -1274,6 +1296,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             conics,
             colors,
             opacities,
+            depths,
+            terminator_depths,
             backgrounds,
             masks,
             width,
@@ -1355,7 +1379,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         if absgrad:
             means2d.absgrad = v_means2d_abs
 
-        if ctx.needs_input_grad[4]:
+        if ctx.needs_input_grad[6]:
             v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
                 dim=(-3, -2)
             )
@@ -1367,6 +1391,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_conics,
             v_colors,
             v_opacities,
+            None,
+            None,
             v_backgrounds,
             None,
             None,

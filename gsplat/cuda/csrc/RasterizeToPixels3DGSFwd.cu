@@ -24,6 +24,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const vec3 *__restrict__ conics,          // [I, N, 3] or [nnz, 3]
     const scalar_t *__restrict__ colors,      // [I, N, CDIM] or [nnz, CDIM]
     const scalar_t *__restrict__ opacities,   // [I, N] or [nnz]
+    const scalar_t *__restrict__ depths,      // [I, N] or [nnz]
+    const scalar_t *__restrict__ terminator_depths, // [I, H, W]
     const scalar_t *__restrict__ backgrounds, // [I, CDIM]
     const bool *__restrict__ masks,           // [I, tile_height, tile_width]
     const uint32_t image_width,
@@ -54,6 +56,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     last_ids += image_id * image_height * image_width;
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
+    }
+    if (terminator_depths != nullptr) {
+        terminator_depths += image_id * image_height * image_width;
     }
     if (masks != nullptr) {
         masks += image_id * tile_height * tile_width;
@@ -97,6 +102,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         reinterpret_cast<vec3 *>(&id_batch[block_size]); // [block_size]
     vec3 *conic_batch =
         reinterpret_cast<vec3 *>(&xy_opacity_batch[block_size]); // [block_size]
+    float *depth_batch =
+        reinterpret_cast<float *>(&conic_batch[block_size]); // [block_size]
 
     // current visibility left to render
     // transmittance is gonna be used in the backward pass which requires a high
@@ -104,7 +111,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     // slower so we stick with float for now.
     float T = 1.0f;
     // index of most recent gaussian to write to this thread's pixel
-    uint32_t cur_idx = 0;
+    int32_t cur_idx = -1;
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing its
@@ -130,6 +137,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             const float opac = opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
             conic_batch[tr] = conics[g];
+            if (depths != nullptr) {
+                depth_batch[tr] = depths[g];
+            }
         }
 
         // wait for other threads to collect the gaussians in batch
@@ -138,6 +148,11 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+            if (terminator_depths != nullptr &&
+                depth_batch[t] > terminator_depths[pix_id]) {
+                done = true;
+                break;
+            }
             const vec3 conic = conic_batch[t];
             const vec3 xy_opac = xy_opacity_batch[t];
             const float opac = xy_opac.z;
@@ -163,7 +178,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             for (uint32_t k = 0; k < CDIM; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
-            cur_idx = batch_start + t;
+            cur_idx = static_cast<int32_t>(batch_start + t);
 
             T = next_T;
         }
@@ -183,7 +198,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
                                        : (pix_out[k] + T * backgrounds[k]);
         }
         // index in bin of last gaussian in this pixel
-        last_ids[pix_id] = static_cast<int32_t>(cur_idx);
+        last_ids[pix_id] = cur_idx;
     }
 }
 
@@ -194,6 +209,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,    // [..., N, channels] or [nnz, channels]
     const at::Tensor opacities, // [..., N]  or [nnz]
+    const at::optional<at::Tensor> depths, // [..., N] or [nnz]
+    const at::optional<at::Tensor> terminator_depths, // [..., H, W]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -221,8 +238,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     dim3 threads = {tile_size, tile_size, 1};
     dim3 grid = {I, tile_height, tile_width};
 
-    int64_t shmem_size =
-        tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
+    int64_t shmem_size = tile_size * tile_size *
+                         (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) +
+                          (depths.has_value() ? sizeof(float) : 0));
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
@@ -249,6 +267,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             reinterpret_cast<vec3 *>(conics.data_ptr<float>()),
             colors.data_ptr<float>(),
             opacities.data_ptr<float>(),
+            depths.has_value() ? depths.value().data_ptr<float>() : nullptr,
+            terminator_depths.has_value()
+                ? terminator_depths.value().data_ptr<float>()
+                : nullptr,
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
                                     : nullptr,
             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
@@ -274,6 +296,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor conics,                                               \
         const at::Tensor colors,                                               \
         const at::Tensor opacities,                                            \
+        const at::optional<at::Tensor> depths,                                 \
+        const at::optional<at::Tensor> terminator_depths,                      \
         const at::optional<at::Tensor> backgrounds,                            \
         const at::optional<at::Tensor> masks,                                  \
         uint32_t image_width,                                                  \

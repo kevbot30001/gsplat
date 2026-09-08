@@ -59,6 +59,8 @@ def rasterization(
     covars: Optional[Tensor] = None,
     with_ut: bool = False,
     with_eval3d: bool = False,
+    terminator_depth: Optional[Tensor] = None,  # [..., C, H, W]
+    terminator_coverage: Optional[Tensor] = None,  # [..., C, H, W]
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
     tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
@@ -211,6 +213,11 @@ def rasterization(
         with_ut: Whether to use Unscented Transform (UT) for projection. Default is False.
         with_eval3d: Whether to calculate Gaussian response in 3D world space, instead
             of 2D image space. Default is False.
+        terminator_depth: Optional camera-space depth of an opaque per-pixel surface.
+            Gaussians at equal depth remain visible. [..., C, height, width].
+        terminator_coverage: Optional geometric coverage of the opaque surface in
+            [0, 1]. When omitted, finite terminator depths imply full coverage.
+            [..., C, height, width].
         radial_coeffs: Opencv pinhole/fisheye radial distortion coefficients. Default is None.
             For pinhole camera, the shape should be [..., C, 6]. For fisheye camera, the shape
             should be [..., C, 4].
@@ -286,6 +293,33 @@ def rasterization(
     assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
     assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
+    if terminator_depth is None:
+        if terminator_coverage is not None:
+            raise ValueError("terminator_coverage requires terminator_depth")
+    else:
+        expected_terminator_shape = batch_dims + (C, height, width)
+        if terminator_depth.shape != expected_terminator_shape:
+            raise ValueError(
+                f"terminator_depth must have shape {expected_terminator_shape}, "
+                f"got {tuple(terminator_depth.shape)}"
+            )
+        if terminator_depth.device != device or terminator_depth.dtype != means.dtype:
+            raise ValueError("terminator_depth must match means device and dtype")
+        if terminator_coverage is None:
+            terminator_coverage = torch.isfinite(terminator_depth).to(means.dtype)
+        elif terminator_coverage.shape != expected_terminator_shape:
+            raise ValueError(
+                f"terminator_coverage must have shape {expected_terminator_shape}, "
+                f"got {tuple(terminator_coverage.shape)}"
+            )
+        elif terminator_coverage.device != device or terminator_coverage.dtype != means.dtype:
+            raise ValueError("terminator_coverage must match means device and dtype")
+        if with_eval3d:
+            raise ValueError("opaque depth termination is not supported with with_eval3d=True")
+        if distributed:
+            raise ValueError("opaque depth termination is not supported with distributed=True")
+        terminator_depth = terminator_depth.contiguous()
+        terminator_coverage = terminator_coverage.clamp(0.0, 1.0).contiguous()
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -466,6 +500,70 @@ def rasterization(
             "opacities": opacities,
         }
     )
+
+    def rasterize_chunk(
+        colors_chunk: Tensor, backgrounds_chunk: Optional[Tensor]
+    ) -> Tuple[Tensor, Tensor]:
+        if with_eval3d:
+            return rasterize_to_pixels_eval3d(
+                means,
+                quats,
+                scales,
+                colors_chunk,
+                opacities,
+                viewmats,
+                Ks,
+                width,
+                height,
+                tile_size,
+                isect_offsets,
+                flatten_ids,
+                backgrounds=backgrounds_chunk,
+                camera_model=camera_model,
+                radial_coeffs=radial_coeffs,
+                tangential_coeffs=tangential_coeffs,
+                thin_prism_coeffs=thin_prism_coeffs,
+                ftheta_coeffs=ftheta_coeffs,
+                rolling_shutter=rolling_shutter,
+                viewmats_rs=viewmats_rs,
+            )
+        full_colors, full_alphas = rasterize_to_pixels(
+            means2d,
+            conics,
+            colors_chunk,
+            opacities,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            backgrounds=backgrounds_chunk,
+            packed=packed,
+            absgrad=absgrad,
+        )
+        if terminator_depth is None:
+            return full_colors, full_alphas
+        front_colors, front_alphas = rasterize_to_pixels(
+            means2d,
+            conics,
+            colors_chunk,
+            opacities,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            depths=depths,
+            terminator_depths=terminator_depth,
+            packed=packed,
+            absgrad=absgrad,
+        )
+        coverage = terminator_coverage[..., None]
+        meta["terminator_transmittance"] = 1.0 - front_alphas
+        return (
+            torch.lerp(full_colors, front_colors, coverage),
+            torch.lerp(full_alphas, front_alphas, coverage),
+        )
 
     # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
@@ -676,87 +774,15 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            if with_eval3d:
-                render_colors_, render_alphas_ = rasterize_to_pixels_eval3d(
-                    means,
-                    quats,
-                    scales,
-                    colors_chunk,
-                    opacities,
-                    viewmats,
-                    Ks,
-                    width,
-                    height,
-                    tile_size,
-                    isect_offsets,
-                    flatten_ids,
-                    backgrounds=backgrounds_chunk,
-                    camera_model=camera_model,
-                    radial_coeffs=radial_coeffs,
-                    tangential_coeffs=tangential_coeffs,
-                    thin_prism_coeffs=thin_prism_coeffs,
-                    ftheta_coeffs=ftheta_coeffs,
-                    rolling_shutter=rolling_shutter,
-                    viewmats_rs=viewmats_rs,
-                )
-            else:
-                render_colors_, render_alphas_ = rasterize_to_pixels(
-                    means2d,
-                    conics,
-                    colors_chunk,
-                    opacities,
-                    width,
-                    height,
-                    tile_size,
-                    isect_offsets,
-                    flatten_ids,
-                    backgrounds=backgrounds_chunk,
-                    packed=packed,
-                    absgrad=absgrad,
-                )
+            render_colors_, render_alphas_ = rasterize_chunk(
+                colors_chunk, backgrounds_chunk
+            )
             render_colors.append(render_colors_)
             render_alphas.append(render_alphas_)
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
     else:
-        if with_eval3d:
-            render_colors, render_alphas = rasterize_to_pixels_eval3d(
-                means,
-                quats,
-                scales,
-                colors,
-                opacities,
-                viewmats,
-                Ks,
-                width,
-                height,
-                tile_size,
-                isect_offsets,
-                flatten_ids,
-                backgrounds=backgrounds,
-                camera_model=camera_model,
-                radial_coeffs=radial_coeffs,
-                tangential_coeffs=tangential_coeffs,
-                thin_prism_coeffs=thin_prism_coeffs,
-                ftheta_coeffs=ftheta_coeffs,
-                rolling_shutter=rolling_shutter,
-                viewmats_rs=viewmats_rs,
-            )
-        else:
-            render_colors, render_alphas = rasterize_to_pixels(
-                means2d,
-                conics,
-                colors,
-                opacities,
-                width,
-                height,
-                tile_size,
-                isect_offsets,
-                flatten_ids,
-                backgrounds=backgrounds,
-                packed=packed,
-                absgrad=absgrad,
-            )
+        render_colors, render_alphas = rasterize_chunk(colors, backgrounds)
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(

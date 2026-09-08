@@ -23,6 +23,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,    // [..., N, channels] or [nnz, channels]
     const at::Tensor opacities, // [..., N]  or [nnz]
+    const at::optional<at::Tensor> depths, // [..., N] or [nnz]
+    const at::optional<at::Tensor> terminator_depths, // [..., H, W]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -42,6 +44,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     CHECK_INPUT(flatten_ids);
     if (backgrounds.has_value()) {
         CHECK_INPUT(backgrounds.value());
+    }
+    if (depths.has_value()) {
+        CHECK_INPUT(depths.value());
+    }
+    if (terminator_depths.has_value()) {
+        CHECK_INPUT(terminator_depths.value());
     }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
@@ -70,6 +78,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             conics,                                                            \
             colors,                                                            \
             opacities,                                                         \
+            depths,                                                            \
+            terminator_depths,                                                 \
             backgrounds,                                                       \
             masks,                                                             \
             image_width,                                                       \
